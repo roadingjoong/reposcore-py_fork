@@ -74,9 +74,9 @@ def fetch_repository_counts(repository: str) -> dict[str, object]:
 @app.command()
 def main(
     repos: Annotated[
-        Optional[list[str]],
+        list[str],
         typer.Argument(help="조회할 GitHub 저장소 경로입니다. 예: owner/repo1 owner/repo2"),
-    ] = None,
+    ],
     format: Annotated[
         str,
         typer.Option("--format", "-f", help="출력 파일 형식을 지정합니다. (csv | txt | html)"),
@@ -90,8 +90,9 @@ def main(
     user = User(name="test", score=100)
     print(user)
 
-    if not repos:
-        repos = [DEFAULT_REPOSITORY]
+    if len(repos) == 0:
+        typer.echo("오류: 저장소를 하나 이상 입력해주세요.", err=True)
+        raise typer.Exit(1)
 
     for repo in repos:
         try:
