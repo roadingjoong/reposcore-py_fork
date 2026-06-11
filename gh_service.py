@@ -1,12 +1,56 @@
 from __future__ import annotations
-
 import os
-
 from gql import Client, gql
 from gql.transport.requests import RequestsHTTPTransport
-
+from pydantic import BaseModel
 from calc_score import UserContributionCounts
 
+
+# ── Pydantic 모델 정의 ──────────────────────────────────────────
+
+class Author(BaseModel):
+    login: str
+
+class Label(BaseModel):
+    name: str
+
+class LabelConnection(BaseModel):
+    nodes: list[Label]
+
+class IssueNode(BaseModel):
+    author: Author | None
+    labels: LabelConnection
+
+class PRNode(BaseModel):
+    author: Author | None
+    labels: LabelConnection
+
+class PageInfo(BaseModel):
+    hasNextPage: bool
+    endCursor: str | None
+
+class IssueConnection(BaseModel):
+    pageInfo: PageInfo
+    nodes: list[IssueNode]
+
+class PRConnection(BaseModel):
+    pageInfo: PageInfo
+    nodes: list[PRNode]
+
+class IssueRepository(BaseModel):
+    issues: IssueConnection
+
+class PRRepository(BaseModel):
+    pullRequests: PRConnection
+
+class IssueResponse(BaseModel):
+    repository: IssueRepository
+
+class PRResponse(BaseModel):
+    repository: PRRepository
+
+
+# ── 클라이언트 생성 ──────────────────────────────────────────────
 
 def create_client(token: str) -> Client:
     transport = RequestsHTTPTransport(
@@ -18,90 +62,111 @@ def create_client(token: str) -> Client:
     return Client(transport=transport, fetch_schema_from_transport=False)
 
 
+# ── 기여 데이터 수집 ──────────────────────────────────────────────
+
 def fetch_contributions(repository: str, token: str) -> list[UserContributionCounts]:
     owner, name = repository.split("/", maxsplit=1)
     client = create_client(token)
-
     contributions: dict[str, UserContributionCounts] = {}
 
-    combined_query = gql("""
-    query($owner: String!, $name: String!, $issueCursor: String, $prCursor: String) {
+    # 이슈 수집
+    issue_query = gql("""
+    query($owner: String!, $name: String!, $after: String) {
         repository(owner: $owner, name: $name) {
-            issues(first: 100, after: $issueCursor, states: [OPEN, CLOSED]) {
-                pageInfo { hasNextPage endCursor }
-                nodes {
-                    author { login }
-                    labels(first: 10) { nodes { name } }
+            issues(first: 100, after: $after, states: [OPEN, CLOSED]) {
+                pageInfo {
+                    hasNextPage
+                    endCursor
                 }
-            }
-            pullRequests(first: 100, after: $prCursor, states: [MERGED]) {
-                pageInfo { hasNextPage endCursor }
                 nodes {
                     author { login }
-                    labels(first: 10) { nodes { name } }
+                    labels(first: 10) {
+                        nodes { name }
+                    }
                 }
             }
         }
     }
     """)
 
-    issue_cursor: str | None = None
-    pr_cursor: str | None = None
-    fetch_issues = True
-    fetch_prs = True
-
-    while fetch_issues or fetch_prs:
-        variables: dict = {"owner": owner, "name": name}
-        if fetch_issues:
-            variables["issueCursor"] = issue_cursor
-        if fetch_prs:
-            variables["prCursor"] = pr_cursor
-
+    cursor = None
+    while True:
         with client as session:
-            result = session.execute(combined_query, variable_values=variables)
+            result = session.execute(issue_query, variable_values={
+                "owner": owner,
+                "name": name,
+                "after": cursor,
+            })
 
-        repo = result["repository"]
+        response = IssueResponse.model_validate(result)
+        issues = response.repository.issues
 
-        # 이슈 처리
-        if fetch_issues:
-            issues = repo["issues"]
-            for node in issues["nodes"]:
-                if not node["author"]:
-                    continue
-                user = node["author"]["login"]
-                labels = [l["name"].lower() for l in node["labels"]["nodes"]]
-                if user not in contributions:
-                    contributions[user] = UserContributionCounts(user=user)
-                if "documentation" in labels:
-                    contributions[user].doc_issue_count += 1
-                elif "bug" in labels or "enhancement" in labels:
-                    contributions[user].feature_bug_issue_count += 1
+        for node in issues.nodes:
+            if node.author is None:
+                continue
+            user = node.author.login
+            labels = [label.name.lower() for label in node.labels.nodes]
 
-            if issues["pageInfo"]["hasNextPage"]:
-                issue_cursor = issues["pageInfo"]["endCursor"]
-            else:
-                fetch_issues = False
+            if user not in contributions:
+                contributions[user] = UserContributionCounts(user=user)
+            if "documentation" in labels:
+                contributions[user].doc_issue_count += 1
+            elif "bug" in labels or "enhancement" in labels:
+                contributions[user].feature_bug_issue_count += 1
 
-        # PR 처리
-        if fetch_prs:
-            prs = repo["pullRequests"]
-            for node in prs["nodes"]:
-                if not node["author"]:
-                    continue
-                user = node["author"]["login"]
-                labels = [l["name"].lower() for l in node["labels"]["nodes"]]
-                if user not in contributions:
-                    contributions[user] = UserContributionCounts(user=user)
-                if "documentation" in labels:
-                    contributions[user].doc_pr_count += 1
-                elif "typo" in labels:
-                    contributions[user].typo_pr_count += 1
-                elif "bug" in labels or "enhancement" in labels:
-                    contributions[user].feature_bug_pr_count += 1
+        if not issues.pageInfo.hasNextPage:
+            break
+        cursor = issues.pageInfo.endCursor
 
-            if prs["pageInfo"]["hasNextPage"]:
-                pr_cursor = prs["pageInfo"]["endCursor"]
-            else:
-                fetch_prs = False
+    # PR 수집
+    pr_query = gql("""
+    query($owner: String!, $name: String!, $after: String) {
+        repository(owner: $owner, name: $name) {
+            pullRequests(first: 100, after: $after, states: [MERGED]) {
+                pageInfo {
+                    hasNextPage
+                    endCursor
+                }
+                nodes {
+                    author { login }
+                    labels(first: 10) {
+                        nodes { name }
+                    }
+                }
+            }
+        }
+    }
+    """)
+
+    cursor = None
+    while True:
+        with client as session:
+            result = session.execute(pr_query, variable_values={
+                "owner": owner,
+                "name": name,
+                "after": cursor,
+            })
+
+        response = PRResponse.model_validate(result)
+        prs = response.repository.pullRequests
+
+        for node in prs.nodes:
+            if node.author is None:
+                continue
+            user = node.author.login
+            labels = [label.name.lower() for label in node.labels.nodes]
+
+            if user not in contributions:
+                contributions[user] = UserContributionCounts(user=user)
+            if "documentation" in labels:
+                contributions[user].doc_pr_count += 1
+            elif "typo" in labels:
+                contributions[user].typo_pr_count += 1
+            elif "bug" in labels or "enhancement" in labels:
+                contributions[user].feature_bug_pr_count += 1
+
+        if not prs.pageInfo.hasNextPage:
+            break
+        cursor = prs.pageInfo.endCursor
 
     return list(contributions.values())
